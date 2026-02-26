@@ -108,24 +108,47 @@ public:
     {
         if (this != &other)
         {
+            // 如果当前对象是错误状态（m_value为nullptr），需要先初始化
+            if (!m_value) {
+                init_new_doc();
+            }
             m_value->CopyFrom(other.get_rapidjson_value(), get_allocator());
+            m_error = other.m_error;
+            m_error_message = other.m_error_message;
         }
         return *this;
     }
-    Xjson(Xjson &&other) NOEXCEPT : m_doc(std::move(other.m_doc)), m_value(other.m_value) { other.m_value = nullptr; }
+    Xjson(Xjson &&other) NOEXCEPT
+        : m_doc(std::move(other.m_doc)),
+          m_value(other.m_value),
+          m_error(other.m_error),
+          m_error_message(std::move(other.m_error_message))
+    {
+        // 将被移动的对象重置为有效状态
+        other.init_new_doc();
+        other.m_value->SetNull();
+        other.m_error = XjsonError::Ok;
+    }
 
     Xjson &operator=(Xjson &&other) NOEXCEPT
     {
         if (this != &other)
         {
+            // 如果当前对象是文档根节点，且other也是文档根节点，可以高效移动
             if (m_value == m_doc.get() && other.m_value == other.m_doc.get()) {
-                // Efficient move if both are document roots
                 m_doc = std::move(other.m_doc);
                 m_value = m_doc.get();
-                other.m_value = nullptr;
+                m_error = other.m_error;
+                m_error_message = std::move(other.m_error_message);
+                // 重置other为有效状态
+                other.init_new_doc();
+                other.m_value->SetNull();
+                other.m_error = XjsonError::Ok;
             } else {
-                // Otherwise, perform a deep copy
+                // 否则执行深拷贝（子对象赋值给另一个子对象的情况）
                 m_value->CopyFrom(other.get_rapidjson_value(), get_allocator());
+                m_error = other.m_error;
+                m_error_message = std::move(other.m_error_message);
             }
         }
         return *this;
@@ -166,6 +189,8 @@ public:
     }
     std::string dump(int indent = -1) const
     {
+        if (!m_value)
+            return "null";
         rapidjson::StringBuffer buffer;
         if (indent >= 0)
         {
@@ -182,17 +207,17 @@ public:
     }
 
     // --- Type Checks ---
-    bool is_null() const { return m_value->IsNull(); }
-    bool is_bool() const { return m_value->IsBool(); }
-    bool is_number() const { return m_value->IsNumber(); }
-    bool is_int() const { return m_value->IsInt(); }
-    bool is_int64() const { return m_value->IsInt64(); }
-    bool is_uint() const { return m_value->IsUint(); }
-    bool is_uint64() const { return m_value->IsUint64(); }
-    bool is_double() const { return m_value->IsDouble(); }
-    bool is_string() const { return m_value->IsString(); }
-    bool is_array() const { return m_value->IsArray(); }
-    bool is_object() const { return m_value->IsObject(); }
+    bool is_null() const { return m_value ? m_value->IsNull() : true; }
+    bool is_bool() const { return m_value ? m_value->IsBool() : false; }
+    bool is_number() const { return m_value ? m_value->IsNumber() : false; }
+    bool is_int() const { return m_value ? m_value->IsInt() : false; }
+    bool is_int64() const { return m_value ? m_value->IsInt64() : false; }
+    bool is_uint() const { return m_value ? m_value->IsUint() : false; }
+    bool is_uint64() const { return m_value ? m_value->IsUint64() : false; }
+    bool is_double() const { return m_value ? m_value->IsDouble() : false; }
+    bool is_string() const { return m_value ? m_value->IsString() : false; }
+    bool is_array() const { return m_value ? m_value->IsArray() : false; }
+    bool is_object() const { return m_value ? m_value->IsObject() : false; }
 
     // --- Value Accessors ---
     template <typename T>
@@ -257,10 +282,13 @@ public:
             m_value->SetArray();
         if (!is_array())
             return Xjson(XjsonError::NotAnArray, "Value is not an array, cannot use integer index.");
-        if (index >= m_value->Size())
+        // 检查负数索引
+        if (index < 0)
+            return Xjson(XjsonError::IndexOutOfBounds, "Index " + std::to_string(index) + " is negative.");
+        if (index >= static_cast<int>(m_value->Size()))
         {
             m_value->Reserve(index + 1, get_allocator());
-            while (index >= m_value->Size())
+            while (index >= static_cast<int>(m_value->Size()))
             {
                 m_value->PushBack(rapidjson::Value(), get_allocator());
             }
@@ -294,7 +322,8 @@ public:
         if (!is_array())
         {
             m_error = XjsonError::NotAnArray;
-            m_error_message = "JSON not an array error at offset " + std::to_string(m_doc->GetErrorOffset());
+            m_error_message = "Cannot push_back to a non-array value";
+            return;  // 错误时直接返回，不执行PushBack
         }
         rapidjson::Value copied_value;
         copied_value.CopyFrom(value.get_rapidjson_value(), get_allocator());
@@ -313,6 +342,8 @@ public:
     bool empty() const { return size() == 0; }
     void clear()
     {
+        if (!m_value)
+            return;
         if (is_array())
             m_value->Clear();
         else if (is_object())
@@ -342,9 +373,20 @@ private:
     {
         init_new_doc();
         m_value->CopyFrom(other.get_rapidjson_value(), get_allocator());
+        m_error = other.m_error;
+        m_error_message = other.m_error_message;
     }
-    rapidjson::Document::AllocatorType &get_allocator() { return m_doc->GetAllocator(); }
-    const rapidjson::Value &get_rapidjson_value() const { return *m_value; }
+    rapidjson::Document::AllocatorType &get_allocator() {
+        if (!m_doc) {
+            // 如果m_doc为nullptr，创建一个新的（这种情况发生在错误状态对象上）
+            init_new_doc();
+        }
+        return m_doc->GetAllocator();
+    }
+    const rapidjson::Value &get_rapidjson_value() const {
+        static const rapidjson::Value null_value;
+        return m_value ? *m_value : null_value;
+    }
 
 private:
     std::shared_ptr<rapidjson::Document> m_doc;
@@ -362,7 +404,7 @@ private:
 template <>
 inline int Xjson::get<int>() const
 {
-    if (!m_value->IsInt())
+    if (!m_value || !m_value->IsInt())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not an int.";
@@ -374,7 +416,7 @@ inline int Xjson::get<int>() const
 template <>
 inline int64_t Xjson::get<int64_t>() const
 {
-    if (!m_value->IsInt64())
+    if (!m_value || !m_value->IsInt64())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not an int64.";
@@ -386,7 +428,7 @@ inline int64_t Xjson::get<int64_t>() const
 template <>
 inline uint8_t Xjson::get<uint8_t>() const
 {
-    if (!m_value->IsUint())
+    if (!m_value || !m_value->IsUint())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a uint.";
@@ -406,7 +448,7 @@ inline uint8_t Xjson::get<uint8_t>() const
 template <>
 inline uint32_t Xjson::get<uint32_t>() const
 {
-    if (!m_value->IsUint())
+    if (!m_value || !m_value->IsUint())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a uint.";
@@ -418,7 +460,7 @@ inline uint32_t Xjson::get<uint32_t>() const
 template <>
 inline uint64_t Xjson::get<uint64_t>() const
 {
-    if (!m_value->IsUint64())
+    if (!m_value || !m_value->IsUint64())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a uint64.";
@@ -430,7 +472,7 @@ inline uint64_t Xjson::get<uint64_t>() const
 template <>
 inline double Xjson::get<double>() const
 {
-    if (!m_value->IsNumber())
+    if (!m_value || !m_value->IsNumber())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a number.";
@@ -442,7 +484,7 @@ inline double Xjson::get<double>() const
 template <>
 inline bool Xjson::get<bool>() const
 {
-    if (!m_value->IsBool())
+    if (!m_value || !m_value->IsBool())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a boolean.";
@@ -454,7 +496,7 @@ inline bool Xjson::get<bool>() const
 template <>
 inline std::string Xjson::get<std::string>() const
 {
-    if (!m_value->IsString())
+    if (!m_value || !m_value->IsString())
     {
         m_error = XjsonError::WrongType;
         m_error_message = "Type error: value is not a string.";
@@ -535,7 +577,7 @@ public:
     value_type value() const
     {
         if (m_is_array)
-            return "";
+            return value_type(m_parent->m_doc, &(*m_arr_it));
         return value_type(m_parent->m_doc, &(m_obj_it->value));
     }
 
@@ -608,7 +650,7 @@ public:
     Xjson value() const
     {
         if (m_is_array)
-            return "";
+            return Xjson(m_parent->m_doc, const_cast<rapidjson::Value*>(&(*m_arr_it)));
         return Xjson(m_parent->m_doc, const_cast<rapidjson::Value*>(&m_obj_it->value));
     }
 
@@ -644,28 +686,24 @@ inline Xjson::iterator Xjson::end()
 
 inline Xjson::const_iterator Xjson::begin() const
 {
-    if (has_error() || !is_object())
-    {
-        if (is_array())
-            return const_iterator(this, m_value->Begin());
-        return const_iterator(this, rapidjson::Value::MemberIterator());
-    }
+    if (has_error())
+        return end();
     if (is_array())
         return const_iterator(this, m_value->Begin());
-    return const_iterator(this, m_value->MemberEnd());
+    if (is_object())
+        return const_iterator(this, m_value->MemberBegin());
+    return end();
 }
 
 inline Xjson::const_iterator Xjson::end() const
 {
-    if (has_error() || !is_object())
-    {
-        if (is_array())
-            return const_iterator(this, m_value->End());
-        return const_iterator(this, rapidjson::Value::MemberIterator());
-    }
+    if (has_error())
+        return const_iterator(this, rapidjson::Value::ConstMemberIterator());
     if (is_array())
         return const_iterator(this, m_value->End());
-    return const_iterator(this, m_value->MemberEnd());
+    if (is_object())
+        return const_iterator(this, m_value->MemberEnd());
+    return const_iterator(this, rapidjson::Value::ConstMemberIterator());
 }
 
 inline Xjson::const_iterator Xjson::cbegin() const { return begin(); }
